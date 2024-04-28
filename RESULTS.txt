@@ -1,0 +1,44 @@
+./bcache 1 100 100
+ elapsed time: 0.67s
+bcache  reads: 100
+bcache writes: 0
+bcache   perf: 149.65 ops/s
+  disk  reads: 47
+  disk writes: 0
+  disk   perf: 70.34 ops/s
+
+./bcache 1 20 100
+ elapsed time: 0.67s
+bcache  reads: 100
+bcache writes: 0
+bcache   perf: 149.49 ops/s
+  disk  reads: 47
+  disk writes: 0
+  disk   perf: 70.26 ops/s
+
+./bcache 10 100 100
+   elapsed time: 4.05s
+bcache  reads: 700
+bcache writes: 300
+bcache   perf: 247.11 ops/s
+  disk  reads: 89
+  disk writes: 255
+  disk   perf: 85.01 ops/s
+
+./bcache 10 20 100
+ elapsed time: 3.99s
+bcache  reads: 700
+bcache writes: 300
+bcache   perf: 250.89 ops/s
+  disk  reads: 96
+  disk writes: 241
+  disk   perf: 84.55 ops/s
+
+./bcache 20 5 100
+ elapsed time: 6.37s
+bcache  reads: 1400
+bcache writes: 600
+bcache   perf: 314.09 ops/s
+  disk  reads: 134
+  disk writes: 427
+  disk   perf: 88.10 ops/s
