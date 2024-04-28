@@ -11,21 +11,19 @@ Feel free to add any structures, types or helper functions that you need.
 #include <stdio.h>
 #include <pthread.h>
 #include <string.h>
-#include <stdbool.h>
 
 /*
 A structure describing the entire buffer cache.
 You may add and modify this structure as needed.
 */
 
-struct bcache {
-    struct disk *disk;           // The disk object underlying the cache.
-    struct block *cache;         // Pointer to the first block in the cache.
-    int memory_blocks;           // The total number of memory blocks in the cache.
-    int nreads;                  // A running count of read operations.
-    int nwrites;                 // A running count of write operations.
-    pthread_mutex_t cache_lock;  // Mutex for protecting access to the cache.
-};
+#include "bcache.h"
+#include "disk.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <pthread.h>
+#include <string.h>
+#include <unistd.h>
 
 typedef enum {
     BLOCK_FREE,      // Block is free and not currently being used.
@@ -41,15 +39,20 @@ struct block {
     char data[4096];             // Data storage for the block
     pthread_mutex_t lock;        // Protects this block structure
     pthread_cond_t cond;         // Condition variable for state changes
-    struct block* next;          // Next block in the linked list
+    struct block *next;          // Next block in the linked list
 };
 
-/*
-Create and initialize the buffer cache object.
-You may modify this function as needed to set things up.
-*/
+struct bcache {
+    struct disk *disk;           // The disk object underlying the cache.
+    struct block *cache;         // Pointer to the first block in the cache.
+    int memory_blocks;           // The total number of memory blocks in the cache.
+    int nreads;                  // A running count of read operations.
+    int nwrites;                 // A running count of write operations.
+    pthread_mutex_t cache_lock;  // Mutex for protecting access to the cache.
+    pthread_mutex_t disk_lock;   // Mutex for serializing access to the disk.
+};
 
-struct bcache * bcache_create(struct disk *d, int memory_blocks) {
+struct bcache *bcache_create(struct disk *d, int memory_blocks) {
     struct bcache *bc = malloc(sizeof(*bc));
     if (!bc) {
         fprintf(stderr, "Failed to allocate memory for buffer cache.\n");
@@ -60,155 +63,133 @@ struct bcache * bcache_create(struct disk *d, int memory_blocks) {
     bc->memory_blocks = memory_blocks;
     bc->nreads = 0;
     bc->nwrites = 0;
-    bc->cache = NULL; // Initialize the cache pointer to NULL
+    bc->cache = NULL;
 
-    if (pthread_mutex_init(&bc->cache_lock, NULL) != 0) {
-        fprintf(stderr, "Failed to initialize cache lock.\n");
-        free(bc);
-        return NULL;
-    }
+    pthread_mutex_init(&bc->cache_lock, NULL);
+    pthread_mutex_init(&bc->disk_lock, NULL);
 
     return bc;
 }
 
-struct block* find_block(struct bcache* bc, int blocknum) {
-    struct block* current = bc->cache;
-    while (current) {
-        if (current->blocknum == blocknum && current->state != BLOCK_FREE) {
-            return current;
-        }
-        current = current->next;
+struct block *find_or_create_block(struct bcache *bc, int blocknum) {
+    struct block *blk = bc->cache;
+    while (blk) {
+        if (blk->blocknum == blocknum) return blk;
+        blk = blk->next;
     }
-    return NULL;
-}
 
-void add_block_to_cache(struct bcache* bc, int blocknum, const char* data) {
-    struct block* new_block = malloc(sizeof(struct block));
-    if (!new_block) {
-        fprintf(stderr, "Failed to allocate memory for a new block.\n");
-        return;
+    // Create new block if not found
+    blk = malloc(sizeof(struct block));
+    if (!blk) {
+        fprintf(stderr, "Failed to allocate block.\n");
+        return NULL;
     }
-    new_block->blocknum = blocknum;
-    memcpy(new_block->data, data, 4096);
-    new_block->state = BLOCK_READY;
-    pthread_mutex_init(&new_block->lock, NULL);
-    pthread_cond_init(&new_block->cond, NULL);
-    
-    new_block->next = bc->cache;
-    bc->cache = new_block;
+    blk->blocknum = blocknum;
+    blk->state = BLOCK_FREE;
+    pthread_mutex_init(&blk->lock, NULL);
+    pthread_cond_init(&blk->cond, NULL);
+    blk->next = bc->cache;
+    bc->cache = blk;
+    return blk;
 }
-
-
-/*
-Read a block through the buffer cache.
-This is a dummy implementation that calls disk_read directly.
-It will work only for one thread, and it won't be particularly fast.
-Instead, it should manipulate the data structure and wait for the scheduler.
-*/
 
 void bcache_read(struct bcache *bc, int blocknum, char *data) {
+    struct block *blk = NULL;
+
     pthread_mutex_lock(&bc->cache_lock);
-    struct block *blk = find_block(bc, blocknum);
-    if (blk == NULL) {
-        // Block not found in cache, load it from disk
-        blk = malloc(sizeof(struct block));
-        if (!blk) {
-            fprintf(stderr, "Failed to allocate block memory.\n");
-            pthread_mutex_unlock(&bc->cache_lock);
-            return;
-        }
-        blk->blocknum = blocknum;
+    blk = find_or_create_block(bc, blocknum);
+    pthread_mutex_unlock(&bc->cache_lock);
+
+    pthread_mutex_lock(&blk->lock);
+    if (blk->state == BLOCK_FREE || blk->state == BLOCK_DIRTY) {
         blk->state = BLOCK_READING;
-        disk_read(bc->disk, blocknum, blk->data); // Load data from disk
+        pthread_mutex_unlock(&blk->lock);
+
+        pthread_mutex_lock(&bc->disk_lock);
+        disk_read(bc->disk, blocknum, blk->data);
+        pthread_mutex_unlock(&bc->disk_lock);
+
+        pthread_mutex_lock(&blk->lock);
         blk->state = BLOCK_READY;
-        blk->next = bc->cache;
-        bc->cache = blk;
-        pthread_mutex_init(&blk->lock, NULL);
-        pthread_cond_init(&blk->cond, NULL);
+        pthread_cond_broadcast(&blk->cond);
     }
 
-    if (blk->state == BLOCK_READY) {
-        memcpy(data, blk->data, 4096);  // Copy data to user
-        bc->nreads++;
+    while (blk->state != BLOCK_READY) {
+        pthread_cond_wait(&blk->cond, &blk->lock);
     }
-    pthread_mutex_unlock(&bc->cache_lock);
+
+    memcpy(data, blk->data, 4096);
+    pthread_mutex_unlock(&blk->lock);
+    __sync_fetch_and_add(&bc->nreads, 1);
 }
 
 void bcache_write(struct bcache *bc, int blocknum, const char *data) {
     pthread_mutex_lock(&bc->cache_lock);
-    struct block *blk = find_block(bc, blocknum);
-    if (blk == NULL) {
-        // Block not found in cache, create new block
-        blk = malloc(sizeof(struct block));
-        if (!blk) {
-            fprintf(stderr, "Failed to allocate block memory.\n");
-            pthread_mutex_unlock(&bc->cache_lock);
-            return;
-        }
-        blk->blocknum = blocknum;
-        blk->state = BLOCK_DIRTY;
-        blk->next = bc->cache;
-        bc->cache = blk;
-        pthread_mutex_init(&blk->lock, NULL);
-        pthread_cond_init(&blk->cond, NULL);
-    }
-    memcpy(blk->data, data, 4096); // Update block data
-    blk->state = BLOCK_DIRTY;
-    bc->nwrites++;
+    struct block *blk = find_or_create_block(bc, blocknum);
     pthread_mutex_unlock(&bc->cache_lock);
+
+    pthread_mutex_lock(&blk->lock);
+    memcpy(blk->data, data, 4096);
+    blk->state = BLOCK_DIRTY;
+    pthread_mutex_unlock(&blk->lock);
+    __sync_fetch_and_add(&bc->nwrites, 1);
 }
-
-
-/*
-Block until all dirty blocks in the buffer cache have been cleaned.
-This needs to be implemented.
-*/
 
 void bcache_sync(struct bcache *bc) {
+    struct block *blk;
     pthread_mutex_lock(&bc->cache_lock);
-    struct block *current = bc->cache;
-    while (current) {
-        pthread_mutex_lock(&current->lock);
-        if (current->state == BLOCK_DIRTY) {
-            current->state = BLOCK_WRITING;
-            pthread_cond_wait(&current->cond, &current->lock); // Wait for the I/O scheduler to finish writing
+    blk = bc->cache;
+    while (blk) {
+        pthread_mutex_lock(&blk->lock);
+        if (blk->state == BLOCK_DIRTY) {
+            blk->state = BLOCK_WRITING;
+            pthread_mutex_unlock(&blk->lock);
+            pthread_mutex_lock(&bc->disk_lock);
+            disk_write(bc->disk, blk->blocknum, blk->data);
+            pthread_mutex_unlock(&bc->disk_lock);
+            pthread_mutex_lock(&blk->lock);
+            blk->state = BLOCK_READY;
         }
-        pthread_mutex_unlock(&current->lock);
-        current = current->next;
+        pthread_cond_broadcast(&blk->cond);
+        pthread_mutex_unlock(&blk->lock);
+        blk = blk->next;
     }
     pthread_mutex_unlock(&bc->cache_lock);
 }
 
-
-/*
-This is the function that will run the I/O scheduler.
-This needs to be implemented.
-*/
-
-void * bcache_io_scheduler(void *vbc) {
+void *bcache_io_scheduler(void *vbc) {
     struct bcache *bc = (struct bcache *)vbc;
-    while (true) {
+    while (1) {
+        struct block *blk = NULL;
+        int found = 0;
+
         pthread_mutex_lock(&bc->cache_lock);
-        struct block *current = bc->cache;
-        while (current) {
-            pthread_mutex_lock(&current->lock);
-            if (current->state == BLOCK_READING) {
-                disk_read(bc->disk, current->blocknum, current->data);
-                current->state = BLOCK_READY;
-            } else if (current->state == BLOCK_WRITING) {
-                disk_write(bc->disk, current->blocknum, current->data);
-                current->state = BLOCK_READY;
+        for (blk = bc->cache; blk != NULL; blk = blk->next) {
+            pthread_mutex_lock(&blk->lock);
+            if (blk->state == BLOCK_DIRTY) {
+                blk->state = BLOCK_WRITING;
+                pthread_mutex_unlock(&blk->lock);
+
+                pthread_mutex_lock(&bc->disk_lock);
+                disk_write(bc->disk, blk->blocknum, blk->data);
+                pthread_mutex_unlock(&bc->disk_lock);
+
+                pthread_mutex_lock(&blk->lock);
+                blk->state = BLOCK_READY;
+                pthread_cond_broadcast(&blk->cond);
+                found = 1;
             }
-            pthread_cond_signal(&current->cond);
-            pthread_mutex_unlock(&current->lock);
-            current = current->next;
+            pthread_mutex_unlock(&blk->lock);
+            if (found) break;
         }
         pthread_mutex_unlock(&bc->cache_lock);
-        usleep(10000); // Prevent CPU spinning
+
+        if (!found) {
+            sched_yield();  // Yield the processor to reduce busy waiting
+        }
     }
     return NULL;
 }
-
 
 /*
 These functions just return basic information about the buffer cache,
